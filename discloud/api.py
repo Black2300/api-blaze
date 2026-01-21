@@ -1,95 +1,103 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 import requests
 import time
+import json
+from pathlib import Path
 
 app = FastAPI()
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 BLAZE_URL = "https://blaze.bet.br/api/singleplayer-originals/originals/roulette_games/recent/1"
 
-headers = {
+HEADERS = {
     "User-Agent": "Mozilla/5.0",
     "Accept": "application/json, text/plain, */*",
     "Referer": "https://blaze.bet.br/pt/games/double",
 }
 
-cache = {"raw": [], "last_update": 0.0}
 CACHE_SECONDS = 5
+JSON_PATH = Path("resultados.json")
+
+cache = {
+    "data": [],
+    "last_update": 0.0
+}
 
 
-def map_cor(color_value, roll_value=None) -> str | None:
-    """
-    Mapeia o campo 'color' da Blaze para:
-    V = vermelho, P = preto, B = branco
-    """
-    # Caso venha número (padrão da Blaze)
-    if isinstance(color_value, int):
-        return {0: "B", 1: "V", 2: "P"}.get(color_value)
-
-    # Caso venha string
-    if isinstance(color_value, str):
-        c = color_value.strip().lower()
-        if c in ("red", "r", "v", "vermelho"):
+def map_cor(color, numero):
+    if isinstance(color, int):
+        return {0: "B", 1: "V", 2: "P"}.get(color)
+    if isinstance(color, str):
+        c = color.lower()
+        if c in ("red", "v", "vermelho"):
             return "V"
-        if c in ("black", "b", "p", "preto"):
+        if c in ("black", "p", "preto"):
             return "P"
-        if c in ("white", "w", "branco"):
+        if c in ("white", "b", "branco"):
             return "B"
-
-    # Fallback: se o número for 0, normalmente é branco
-    if roll_value == 0:
+    if numero == 0:
         return "B"
-
     return None
 
 
-def fetch_blaze_raw():
-    r = requests.get(BLAZE_URL, headers=headers, timeout=10)
+def salvar_json(data):
+    with open(JSON_PATH, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+def ler_json():
+    if not JSON_PATH.exists():
+        return []
+    with open(JSON_PATH, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def fetch_blaze():
+    r = requests.get(BLAZE_URL, headers=HEADERS, timeout=10)
     r.raise_for_status()
     data = r.json()
-
-    if isinstance(data, list):
-        return data
-    if isinstance(data, dict) and data.get("records"):
-        return data["records"]
-    return []
+    return data if isinstance(data, list) else data.get("records", [])
 
 
 @app.get("/api/resultados/ultimos/{qtd}")
 def ultimos_resultados(qtd: int):
-    if qtd <= 0 or qtd > 200:
-        raise HTTPException(status_code=400, detail="qtd deve estar entre 1 e 200")
+    if qtd < 1 or qtd > 200:
+        raise HTTPException(400, "qtd deve estar entre 1 e 200")
 
     now = time.time()
 
-    # Atualiza cache
     if now - cache["last_update"] > CACHE_SECONDS:
         try:
-            cache["raw"] = fetch_blaze_raw()
+            raw = fetch_blaze()
+            resultados = []
+
+            for item in raw:
+                numero = item.get("roll")
+                timestamp = item.get("created_at")
+                cor = map_cor(item.get("color"), numero)
+
+                if numero is None or timestamp is None or cor is None:
+                    continue
+
+                resultados.append({
+                    "numero": int(numero),
+                    "timestamp": timestamp,
+                    "cor": cor,
+                    "fonte": "blaze_api"
+                })
+
+            cache["data"] = resultados
             cache["last_update"] = now
-        except requests.RequestException as e:
-            if not cache["raw"]:
-                raise HTTPException(status_code=502, detail=f"Falha ao consultar Blaze: {str(e)}")
+            salvar_json(resultados)
 
-    resultados = []
-    for item in cache["raw"]:
-        numero = item.get("roll") if item.get("roll") is not None else item.get("numero")
-        timestamp = item.get("created_at") or item.get("timestamp")
-        cor = map_cor(item.get("color") if item.get("color") is not None else item.get("cor"), numero)
+        except Exception:
+            cache["data"] = ler_json()
 
-        # Remove registros inválidos (evita null)
-        if numero is None or timestamp is None or cor is None:
-            continue
-
-        resultados.append(
-            {
-                "numero": int(numero),
-                "timestamp": timestamp,
-                "cor": cor,
-                "fonte": "blaze_api",
-            }
-        )
-
-        if len(resultados) >= qtd:
-            break
-
-    return resultados
+    return cache["data"][:qtd]
